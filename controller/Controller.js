@@ -14,7 +14,11 @@ const BlockDate = require("./model/BlockDate");
 const BlockNumber = require("./model/BlockNumber");
 const DailyUserLimit = require('./model/DailyUserLimit');
 const OverflowLimit = require('../model/OverflowLimit');
-const Schema=require('../model/Schema')
+const Schema = require('../model/Schema')
+const UserAmount = require('../model/FixAmount')
+const { getCache, setCache } = require("../utils/cache");
+
+
 
 // =======================
 // 📌 Date Utilities for IST (Indian Standard Time - UTC+5:30)
@@ -582,6 +586,107 @@ const loginUser = async (req, res) => {
 
 // ✅ Get Entries (filterable)
 
+// const getEntries = async (req, res) => {
+//   try {
+//     const {
+//       createdBy,
+//       timeCode,
+//       timeLabel,
+//       number,
+//       count,
+//       date,
+//       billNo,
+//       fromDate,
+//       toDate,
+//       loggedInUser,
+//       usertype
+//     } = req.query;
+
+//     const query = { isValid: true };
+
+//     if (createdBy) query.createdBy = createdBy;
+//     if (timeCode) query.timeCode = timeCode;
+//     if (timeLabel) query.timeLabel = timeLabel;
+//     if (number) query.number = number;
+//     if (count) query.count = parseInt(count);
+//     if (billNo) query.billNo = billNo;
+
+//     // Single date filter (using "date" field)
+//     if (date) {
+//       const start = new Date(date);
+//       start.setHours(0, 0, 0, 0);
+//       const end = new Date(date);
+//       end.setHours(23, 59, 59, 999);
+//       query.date = { $gte: start, $lte: end };
+//     }
+//     // Date range filter (using "date" field)
+//     else if (fromDate && toDate) {
+//       const start = new Date(fromDate);
+//       start.setHours(0, 0, 0, 0);
+//       const end = new Date(toDate);
+//       end.setHours(23, 59, 59, 999);
+//       query.date = { $gte: start, $lte: end };
+//     }
+
+//     // Sort primarily by date, secondarily by createdAt
+//     const entries = await Entry.find(query).sort({ date: -1, createdAt: -1 });
+//     // console.log('entries===========', entries) 
+//     // If loggedInUser exists → adjust rates
+//     if (loggedInUser && entries.length > 0) {
+//       // Get unique draws
+//       const uniqueDraws = [...new Set(entries.map(e => e.timeLabel))];
+
+//       // Fetch rate masters for this user
+//       const rateMastersByDraw = {};
+//       for (const draw of uniqueDraws) {
+//         let rateMasterQuery = { user: loggedInUser, draw };
+//         if (draw === "LSK 3 PM") {
+//           rateMasterQuery.draw = "KERALA 3 PM"; // your special case
+//         }
+
+//         const rateMaster = await RateMaster.findOne(rateMasterQuery);
+//         const rateLookup = {};
+//         (rateMaster?.rates || []).forEach(r => {
+//           rateLookup[r.label] = Number(r.rate) || 10;
+//         });
+//         rateMastersByDraw[draw] = rateLookup;
+//       }
+
+//       // Apply rates to entries
+//       const extractBetType = (typeStr) => {
+//         if (!typeStr) return "SUPER";
+//         if (typeStr.toUpperCase().includes("SUPER")) return "SUPER";
+//         if (typeStr.toUpperCase().includes("BOX")) return "BOX";
+//         if (typeStr.toUpperCase().includes("AB")) return "AB";
+//         if (typeStr.toUpperCase().includes("BC")) return "BC";
+//         if (typeStr.toUpperCase().includes("AC")) return "AC";
+//         if (typeStr.includes("-A") || typeStr.endsWith("A")) return "A";
+//         if (typeStr.includes("-B") || typeStr.endsWith("B")) return "B";
+//         if (typeStr.includes("-C") || typeStr.endsWith("C")) return "C";
+//         return typeStr.split("-").pop();
+//       };
+
+//       entries.forEach(e => {
+//         const betType = extractBetType(e.type);
+//         const rateLookup = rateMastersByDraw[e.timeLabel] || {};
+//         const rate = rateLookup[betType] ?? 10; // fallback default
+//         e.rate = rate * (Number(e.count) || 0);
+//       });
+//     }
+//     res.status(200).json(entries);
+//   } catch (error) {
+//     console.error("[GET ENTRIES ERROR]", error);
+//     res.status(500).json({ message: "Failed to fetch entries" });
+//   }
+// };
+const entriesCache = new Map();
+const rateMasterCache = new Map();
+
+// cache TTLs
+const ENTRIES_TTL = 60 * 1000; // 60 seconds
+const RATE_TTL = 10 * 60 * 1000; // 10 minutes
+
+
 const getEntries = async (req, res) => {
   try {
     const {
@@ -598,6 +703,16 @@ const getEntries = async (req, res) => {
       usertype
     } = req.query;
 
+    // 🔑 1. Build cache key
+    const cacheKey = `entries:${JSON.stringify(req.query)}`;
+
+    // 🔍 2. Check entries cache
+    const cached = entriesCache.get(cacheKey);
+    if (cached && cached.expiry > Date.now()) {
+      return res.status(200).json(cached.data);
+    }
+
+    // 🔨 3. Build DB query
     const query = { isValid: true };
 
     if (createdBy) query.createdBy = createdBy;
@@ -607,16 +722,13 @@ const getEntries = async (req, res) => {
     if (count) query.count = parseInt(count);
     if (billNo) query.billNo = billNo;
 
-    // Single date filter (using "date" field)
     if (date) {
       const start = new Date(date);
       start.setHours(0, 0, 0, 0);
       const end = new Date(date);
       end.setHours(23, 59, 59, 999);
       query.date = { $gte: start, $lte: end };
-    }
-    // Date range filter (using "date" field)
-    else if (fromDate && toDate) {
+    } else if (fromDate && toDate) {
       const start = new Date(fromDate);
       start.setHours(0, 0, 0, 0);
       const end = new Date(toDate);
@@ -624,57 +736,73 @@ const getEntries = async (req, res) => {
       query.date = { $gte: start, $lte: end };
     }
 
-    // Sort primarily by date, secondarily by createdAt
+    // 🗄 DB call
     const entries = await Entry.find(query).sort({ date: -1, createdAt: -1 });
-    // console.log('entries===========', entries) 
-    // If loggedInUser exists → adjust rates
+
+    // 🔁 Apply rate logic
     if (loggedInUser && entries.length > 0) {
-      // Get unique draws
       const uniqueDraws = [...new Set(entries.map(e => e.timeLabel))];
 
-      // Fetch rate masters for this user
-      const rateMastersByDraw = {};
       for (const draw of uniqueDraws) {
-        let rateMasterQuery = { user: loggedInUser, draw };
-        if (draw === "LSK 3 PM") {
-          rateMasterQuery.draw = "KERALA 3 PM"; // your special case
+        const rateKey = `rate:${loggedInUser}:${draw}`;
+
+        let rateLookup;
+        const cachedRate = rateMasterCache.get(rateKey);
+
+        if (cachedRate && cachedRate.expiry > Date.now()) {
+          rateLookup = cachedRate.data;
+        } else {
+          let rateMasterQuery = { user: loggedInUser, draw };
+          if (draw === "LSK 3 PM") {
+            rateMasterQuery.draw = "KERALA 3 PM";
+          }
+
+          const rateMaster = await RateMaster.findOne(rateMasterQuery);
+
+          rateLookup = {};
+          (rateMaster?.rates || []).forEach(r => {
+            rateLookup[r.label] = Number(r.rate) || 10;
+          });
+
+          rateMasterCache.set(rateKey, {
+            data: rateLookup,
+            expiry: Date.now() + RATE_TTL
+          });
         }
 
-        const rateMaster = await RateMaster.findOne(rateMasterQuery);
-        const rateLookup = {};
-        (rateMaster?.rates || []).forEach(r => {
-          rateLookup[r.label] = Number(r.rate) || 10;
+        entries.forEach(e => {
+          if (e.timeLabel !== draw) return;
+
+          const type = e.type?.toUpperCase() || "SUPER";
+          let betType = "SUPER";
+          if (type.includes("BOX")) betType = "BOX";
+          else if (type.includes("AB")) betType = "AB";
+          else if (type.includes("BC")) betType = "BC";
+          else if (type.includes("AC")) betType = "AC";
+          else if (type.endsWith("A")) betType = "A";
+          else if (type.endsWith("B")) betType = "B";
+          else if (type.endsWith("C")) betType = "C";
+
+          const rate = rateLookup[betType] ?? 10;
+          e.rate = rate * (Number(e.count) || 0);
         });
-        rateMastersByDraw[draw] = rateLookup;
       }
-
-      // Apply rates to entries
-      const extractBetType = (typeStr) => {
-        if (!typeStr) return "SUPER";
-        if (typeStr.toUpperCase().includes("SUPER")) return "SUPER";
-        if (typeStr.toUpperCase().includes("BOX")) return "BOX";
-        if (typeStr.toUpperCase().includes("AB")) return "AB";
-        if (typeStr.toUpperCase().includes("BC")) return "BC";
-        if (typeStr.toUpperCase().includes("AC")) return "AC";
-        if (typeStr.includes("-A") || typeStr.endsWith("A")) return "A";
-        if (typeStr.includes("-B") || typeStr.endsWith("B")) return "B";
-        if (typeStr.includes("-C") || typeStr.endsWith("C")) return "C";
-        return typeStr.split("-").pop();
-      };
-
-      entries.forEach(e => {
-        const betType = extractBetType(e.type);
-        const rateLookup = rateMastersByDraw[e.timeLabel] || {};
-        const rate = rateLookup[betType] ?? 10; // fallback default
-        e.rate = rate * (Number(e.count) || 0);
-      });
     }
+
+    // 💾 4. Save final response to cache
+    entriesCache.set(cacheKey, {
+      data: entries,
+      expiry: Date.now() + ENTRIES_TTL
+    });
+
     res.status(200).json(entries);
   } catch (error) {
     console.error("[GET ENTRIES ERROR]", error);
     res.status(500).json({ message: "Failed to fetch entries" });
   }
 };
+
+
 const getEntriesWithTimeBlock = async (req, res) => {
   try {
     const {
@@ -1378,7 +1506,7 @@ const drawLabelMap = {
 function normalizeDrawLabel(label) {
   return drawLabelMap[label] || label;
 }
-const netPayMultiday = async (req, res) => {
+const netPayMultiday = async (req, res) => { 
   const { fromDate, toDate, time, agent, fromAccountSummary, loggedInUser } = req.body;
   // console.log('req.body=>>>>>>>>>>>>>>>>', req.body);
 
@@ -1409,7 +1537,8 @@ const netPayMultiday = async (req, res) => {
 
     let entryQuery = {
       createdBy: { $in: agentUsers },
-      date: { $gte: start, $lte: end }
+      createdAt: { $gte: start, $lte: end },
+      isValid:true
     };
 
     if (!isAllTime) {
@@ -1448,8 +1577,8 @@ const netPayMultiday = async (req, res) => {
 
     const stripSpaceBeforeMeridiem = (label) => label.replace(/\s+(PM|AM)$/gi, '$1');
 
-    let resultQuery = { date: { $gte: fromDate, $lte: toDate } };
-
+    const datesList = getDatesBetween(start, end).map(d => formatDateIST(d));
+    let resultQuery = { date: { $in: datesList } };
     if (!isAllTime) {
       if (isArrayTime) {
         // Normalize draw labels to match how results are stored (e.g., LSK 3 PM -> KERALA 3PM)
@@ -1483,7 +1612,7 @@ const netPayMultiday = async (req, res) => {
     );
     // console.log('userRates=>>>>>>>>>>>>>>>>', userRates)
     const processedEntries = entries.map(entry => {
-      const entryDateStr = formatDateIST(new Date(entry.date));
+      const entryDateStr = formatDateIST(new Date(entry.createdAt));
       // Normalize entry draw label to align with result keys (e.g., LSK 3 PM -> KERALA 3PM)
       const normalizedLabel = stripSpaceBeforeMeridiem(normalizeDrawLabel(entry.timeLabel));
       const dayResult = resultByDateTime[`${entryDateStr}_${normalizedLabel}`] || null;
@@ -1842,186 +1971,363 @@ function getDatesBetween(start, end) {
 function formatDate(date) {
   return formatDateIST(date);
 }
+
+
+// const getWinningReport = async (req, res) => {
+//   try {
+//     const { fromDate, toDate, time = "ALL", agent } = req.body;
+
+//     if (!fromDate || !toDate) {
+//       return res.status(400).json({ message: "fromDate and toDate are required" });
+//     }
+
+//     /* ----------------------------------
+//        1️⃣ USERS + DESCENDANTS
+//     ---------------------------------- */
+//     const users = await MainUser.find().select("username createdBy scheme");
+
+//     const userMap = {};
+//     users.forEach(u => userMap[u.username] = u);
+
+//     function getAllDescendants(username, visited = new Set()) {
+//       if (visited.has(username)) return [];
+//       visited.add(username);
+
+//       const children = users
+//         .filter(u => u.createdBy === username)
+//         .map(u => u.username);
+
+//       let all = [...children];
+//       children.forEach(c => {
+//         all = all.concat(getAllDescendants(c, visited));
+//       });
+//       return all;
+//     }
+
+//     const agentUsers = agent
+//       ? [agent, ...getAllDescendants(agent)]
+//       : users.map(u => u.username);
+
+//     /* ----------------------------------
+//        2️⃣ DATE RANGE (IST SAFE)
+//     ---------------------------------- */
+//     const start = parseDateISTStart(fromDate);
+//     const end = parseDateISTEnd(toDate);
+
+//     /* ----------------------------------
+//        3️⃣ ENTRY QUERY (🔥 FIXED)
+//     ---------------------------------- */
+//     const entryQuery = {
+//       createdBy: { $in: agentUsers },
+//       isValid: true,
+//       createdAt: { $gte: start, $lte: end }, // ✅ FIX
+//     };
+
+//     if (time !== "ALL") {
+//       entryQuery.timeLabel = new RegExp(time, "i"); // ✅ FLEXIBLE MATCH
+//     }
+
+//     const entries = await Entry.find(entryQuery).lean();
+
+//     if (!entries.length) {
+//       return res.json({ message: "No entries found", bills: [], grandTotal: 0 });
+//     }
+
+//     /* ----------------------------------
+//        4️⃣ FETCH RESULTS
+//     ---------------------------------- */
+//     const datesList = getDatesBetween(start, end).map(d => formatDateIST(d));
+
+//     const resultQuery = { date: { $in: datesList } };
+
+//     const normalizedTime = parseTimeValue(time);
+//     if (normalizedTime && time !== "ALL") {
+//       resultQuery.time = normalizedTime;
+//     }
+
+//     const results = await Result.find(resultQuery).lean();
+
+//     const resultsByTime = {};
+//     for (const r of results) {
+//       if (!resultsByTime[r.time]) resultsByTime[r.time] = [];
+//       resultsByTime[r.time].push(r);
+//     }
+
+//     /* ----------------------------------
+//        5️⃣ FIND RESULT BY DATE + TIME
+//     ---------------------------------- */
+//     function findDayResult(dateStr, timeLabel) {
+//       const t = parseTimeValue(timeLabel);
+//       const list = resultsByTime[t] || [];
+
+//       const found = list.find(r => formatDateIST(new Date(r.date)) === dateStr);
+//       if (!found) return null;
+
+//       return {
+//         "1": found.prizes?.[0] || null,
+//         "2": found.prizes?.[1] || null,
+//         "3": found.prizes?.[2] || null,
+//         "4": found.prizes?.[3] || null,
+//         "5": found.prizes?.[4] || null,
+//         others: (found.entries || []).map(e => e.result).filter(Boolean)
+//       };
+//     }
+
+//     /* ----------------------------------
+//        6️⃣ CALCULATE WINNING ENTRIES
+//     ---------------------------------- */
+//     const winningEntries = [];
+
+//     for (const e of entries) {
+//       const ds = formatDateIST(new Date(e.createdAt));
+//       const dayResult = findDayResult(ds, e.timeLabel);
+
+//       if (!dayResult) continue;
+
+//       const winAmount = calculateWinAmount(e, dayResult);
+//       if (winAmount <= 0) continue;
+
+//       winningEntries.push({
+//         ...e,
+//         date: ds,
+//         winAmount,
+//         baseType: extractBetType(e.type),
+//         winType: computeWinType(e, dayResult),
+//         name: e.name || "-"
+//       });
+//     }
+
+//     if (!winningEntries.length) {
+//       return res.json({ message: "No winning entries found", bills: [], grandTotal: 0 });
+//     }
+
+//     /* ----------------------------------
+//        7️⃣ GROUP BY BILL
+//     ---------------------------------- */
+//     const billsMap = {};
+
+//     for (const w of winningEntries) {
+//       if (!billsMap[w.billNo]) {
+//         billsMap[w.billNo] = {
+//           billNo: w.billNo,
+//           createdBy: w.createdBy,
+//           scheme: userMap[w.createdBy]?.scheme || "N/A",
+//           winnings: [],
+//           total: 0
+//         };
+//       }
+
+//       billsMap[w.billNo].winnings.push({
+//         number: w.number,
+//         type: w.baseType,
+//         winType: w.winType,
+//         count: w.count,
+//         winAmount: w.winAmount,
+//         name: w.name
+//       });
+
+//       billsMap[w.billNo].total += w.winAmount;
+//     }
+
+//     const bills = Object.values(billsMap);
+//     const grandTotal = bills.reduce((a, b) => a + b.total, 0);
+
+//     return res.json({
+//       fromDate,
+//       toDate,
+//       time,
+//       agent: agent || "ALL",
+//       grandTotal,
+//       bills
+//     });
+
+//   } catch (err) {
+//     console.error("❌ getWinningReport ERROR:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// };
+
 const getWinningReport = async (req, res) => {
   try {
-    const { fromDate, toDate, time, agent } = req.body;
-    // console.log("\n==============================");
-    // console.log("📥 getWinningReport request:", req.body);
+    const { fromDate, toDate, time = "ALL", agent } = req.body;
 
-    if (!fromDate || !toDate || !time) {
-      return res.status(400).json({ message: "fromDate, toDate, and time are required" });
+    if (!fromDate || !toDate) {
+      return res.status(400).json({ message: "fromDate and toDate are required" });
     }
 
-    // --- 1) Users + descendants ---
-    const users = await MainUser.find().select("-password");
+    // 🔑 Cache key (request based)
+    const cacheKey = `winningReport:${fromDate}:${toDate}:${time}:${agent || "ALL"}`;
 
-    function getAllDescendants(username, usersList, visited = new Set()) {
+    // ⚡ Check memory cache
+    const cachedData = getCache(cacheKey);
+    if (cachedData) {
+      console.log("⚡ Winning report from MEMORY cache");
+      return res.json(cachedData);
+    }
+
+    console.log("🐢 Winning report from MongoDB"); 
+
+    /* ================================
+       🔥 ORIGINAL WORKING LOGIC
+       (UNCHANGED)
+    ================================= */
+
+    const users = await MainUser.find().select("username createdBy scheme");
+
+    const userMap = {};
+    users.forEach(u => userMap[u.username] = u);
+
+    function getAllDescendants(username, visited = new Set()) {
       if (visited.has(username)) return [];
       visited.add(username);
-      const children = usersList.filter(u => u.createdBy === username).map(u => u.username);
+
+      const children = users
+        .filter(u => u.createdBy === username)
+        .map(u => u.username);
+
       let all = [...children];
-      children.forEach(child => {
-        all = all.concat(getAllDescendants(child, usersList, visited));
+      children.forEach(c => {
+        all = all.concat(getAllDescendants(c, visited));
       });
       return all;
     }
 
-    const agentUsers = agent ? [agent, ...getAllDescendants(agent, users)] : users.map(u => u.username);
-    // console.log("👥 Agent Users:", agentUsers);
+    const agentUsers = agent
+      ? [agent, ...getAllDescendants(agent)]
+      : users.map(u => u.username);
 
-    // build user->scheme map
-    const userSchemeMap = {};
-    users.forEach(u => { userSchemeMap[u.username] = u.scheme || "N/A"; });
-
-    // --- 2) Date range ---
     const start = parseDateISTStart(fromDate);
     const end = parseDateISTEnd(toDate);
-    // console.log("📅 Date Range (IST):", { 
-    //   start: formatDateIST(start) + ' 00:00:00 IST', 
-    //   end: formatDateIST(end) + ' 23:59:59 IST',
-    //   startUTC: start.toISOString(),
-    //   endUTC: end.toISOString()
-    // });
 
-    // --- 3) Entries ---
     const entryQuery = {
       createdBy: { $in: agentUsers },
       isValid: true,
-      date: { $gte: start, $lte: end },   // ✅ use date field like netPayMultiday
+      createdAt: { $gte: start, $lte: end },
     };
-    if (time !== "ALL") entryQuery.timeLabel = time;
+
+    if (time !== "ALL") {
+      entryQuery.timeLabel = new RegExp(time, "i");
+    }
 
     const entries = await Entry.find(entryQuery).lean();
-    // console.log("📝 Entries fetched:", entries.length);
-    // if (entries.length > 0) {
-    //   console.log("🔹 Example entry:", entries[0]);
-    // }
 
-    if (entries.length === 0) {
-      // console.log("⚠️ No entries found.");
-      return res.json({ message: "No entries found", bills: [], grandTotal: 0 });
+    if (!entries.length) {
+      const emptyResponse = { message: "No entries found", bills: [], grandTotal: 0 };
+      setCache(cacheKey, emptyResponse, 300);
+      return res.json(emptyResponse);
     }
 
-    // --- 4) Results ---
-    const allDates = getDatesBetween(new Date(fromDate), new Date(toDate))
-      .map(d => formatDateIST(d)); // ['2025-08-20', '2025-08-21', ...]
+    const datesList = getDatesBetween(start, end).map(d => formatDateIST(d));
 
-    const resultQuery = { date: { $in: allDates } };
+    const resultQuery = { date: { $in: datesList } };
+
     const normalizedTime = parseTimeValue(time);
-    if (normalizedTime) {
+    if (normalizedTime && time !== "ALL") {
       resultQuery.time = normalizedTime;
     }
-    const resultDocs = await Result.find(resultQuery).lean();
-    // console.log('resultQuery', resultQuery)
-    // console.log("🏆 Results fetched:==", resultDocs.length);
-    // console.log("🏆 Results fetched:==", resultDocs);
 
+    const results = await Result.find(resultQuery).lean();
 
-    // Group results by time
     const resultsByTime = {};
-    for (const r of resultDocs) {
+    for (const r of results) {
       if (!resultsByTime[r.time]) resultsByTime[r.time] = [];
       resultsByTime[r.time].push(r);
     }
-    for (const t in resultsByTime) {
-      resultsByTime[t].sort((a, b) => new Date(a.date) - new Date(b.date));
-    }
-    // console.log("🕒 Results grouped by time:", Object.keys(resultsByTime));
 
     function findDayResult(dateStr, timeLabel) {
-      const normalizedTime = parseTimeValue(timeLabel);
-      const list = resultsByTime[normalizedTime] || [];
-      // console.log('list==========', list);
-      const found = [...list].reverse().find(r => {
-        const rd = formatDateIST(new Date(r.date));
-        return rd === dateStr;
-      });
+      const t = parseTimeValue(timeLabel);
+      const list = resultsByTime[t] || [];
+
+      const found = list.find(r => formatDateIST(new Date(r.date)) === dateStr);
       if (!found) return null;
-      const firstFive = Array.isArray(found.prizes) ? found.prizes : [];
-      const othersRaw = Array.isArray(found.entries) ? found.entries : [];
-      const others = othersRaw.map(e => e.result).filter(Boolean);
+
       return {
-        "1": firstFive[0] || null,
-        "2": firstFive[1] || null,
-        "3": firstFive[2] || null,
-        "4": firstFive[3] || null,
-        "5": firstFive[4] || null,
-        others
+        "1": found.prizes?.[0] || null,
+        "2": found.prizes?.[1] || null,
+        "3": found.prizes?.[2] || null,
+        "4": found.prizes?.[3] || null,
+        "5": found.prizes?.[4] || null,
+        others: (found.entries || []).map(e => e.result).filter(Boolean)
       };
     }
 
-    // --- 5) Evaluate wins ---
     const winningEntries = [];
+
     for (const e of entries) {
-      // console.log('entries============', e)
-      const dateObj = new Date(e.date); // ✅ match frontend behavior
-      const ds = formatDateIST(dateObj);
-
+      const ds = formatDateIST(new Date(e.createdAt));
       const dayResult = findDayResult(ds, e.timeLabel);
-      // console.log(`\n➡️ Checking entry bill:${e.billNo}, num:${e.number}, type:${e.type}, date:${ds}, time:${e.timeLabel}`);
-      if (!dayResult) {
-        // console.log("   ❌ No matching result found for this entry.");
-        continue;
-      }
 
-      const amount = calculateWinAmount(e, dayResult);
-      const winType = computeWinType(e, dayResult);
-      // console.log("   ✅ Found result, winAmount:", amount, "winType:", winType);
+      if (!dayResult) continue;
 
-      if (amount > 0) {
-        // console.log('entries============', e)
-        winningEntries.push({
-          ...e,
-          date: ds,
-          winAmount: amount,
-          baseType: extractBetType(e.type),
-          winType,
-          name: e.name || "-",
-        });
-      }
+      const winAmount = calculateWinAmount(e, dayResult);
+      if (winAmount <= 0) continue;
+
+      winningEntries.push({
+        ...e,
+        date: ds,
+        winAmount,
+        baseType: extractBetType(e.type),
+        winType: computeWinType(e, dayResult),
+        name: e.name || "-"
+      });
     }
 
-    // console.log("✅ Total winning entries:", winningEntries.length);
-
-    if (winningEntries.length === 0) {
-      // console.log("⚠️ No winning entries after evaluation.");
-      return res.json({ message: "No winning entries found", bills: [], grandTotal: 0 });
+    if (!winningEntries.length) {
+      const emptyResponse = { message: "No winning entries found", bills: [], grandTotal: 0 };
+      setCache(cacheKey, emptyResponse, 300);
+      return res.json(emptyResponse);
     }
 
-    // --- 6) Group into bills ---
     const billsMap = {};
+
     for (const w of winningEntries) {
       if (!billsMap[w.billNo]) {
         billsMap[w.billNo] = {
           billNo: w.billNo,
           createdBy: w.createdBy,
-          scheme: userSchemeMap[w.createdBy] || "N/A",
-          winnings: [],
+          scheme: userMap[w.createdBy]?.scheme || "N/A",
+          drawName: w.timeLabel || "N/A",
+           winnings: [],
           total: 0
         };
       }
+
       billsMap[w.billNo].winnings.push({
         number: w.number,
         type: w.baseType,
         winType: w.winType,
         count: w.count,
         winAmount: w.winAmount,
-        name: w.name || "-",
+        name: w.name
       });
+
       billsMap[w.billNo].total += w.winAmount;
     }
 
     const bills = Object.values(billsMap);
-    const grandTotal = bills.reduce((acc, bill) => acc + bill.total, 0);
+    const grandTotal = bills.reduce((a, b) => a + b.total, 0);
 
-    // console.log("📦 Bills grouped:", bills.length, "GrandTotal:", grandTotal);
+    const response = {
+      fromDate,
+      toDate,
+      time,
+      agent: agent || "ALL",
+      grandTotal,
+      bills
+    };
 
-    return res.json({ fromDate, toDate, time, agent: agent || "All Agents", grandTotal, bills, usersList: users.map(u => u.username) });
+    // 💾 Cache FINAL correct response
+    setCache(cacheKey, response, 300);
+
+    return res.json(response);
+
   } catch (err) {
-    console.error("[getWinningReport ERROR]", err);
+    console.error("❌ getWinningReport ERROR:", err);
     res.status(500).json({ error: err.message });
   }
 };
+
+
 
 const normalizeDrawLabelLimit = (label) => {
   if (!label || typeof label !== 'string') return '';
@@ -2803,132 +3109,262 @@ const saveValidEntries = async (req, res) => {
 //   }
 // };
 // 🆕 New endpoint: Sales Report
+// const getSalesReport = async (req, res) => {
+//   try {
+//     const { fromDate, toDate, createdBy, timeLabel, loggedInUser } = req.query;
+
+//     // console.log("📥 getSalesReport request:", req.query);
+
+//     // 1️⃣ Build agent list (loggedInUser or createdBy + descendants)
+//     const allUsers = await MainUser.find().select("username createdBy");
+//     let agentList = [];
+//     if (!createdBy) {
+//       agentList = [loggedInUser, ...getDescendants(loggedInUser, allUsers)];
+//     } else {
+//       agentList = [createdBy, ...getDescendants(createdBy, allUsers)];
+//     }
+//     // console.log("👥 Agent Users (backend):", agentList);
+
+//     // 2️⃣ Build query for entries
+//     const entryQuery = {
+//       createdBy: { $in: agentList },
+//       date: { $gte: new Date(fromDate), $lte: new Date(toDate) },
+//     };
+//     if (timeLabel && timeLabel !== "all") {
+//       entryQuery.timeLabel = timeLabel;
+//     }
+
+//     const entries = await Entry.find(entryQuery);
+//     const last10Entries = await Entry.find({}).sort({ _id: -1 }).limit(2);
+//     // console.log("entrie===========11", entryQuery)
+//     // console.log("entrie===========12", last10Entries)
+//     // console.log("entrie===========13", entries);
+//     // console.log("📝 Entries fetched (backend):", entries.length);
+//     // if (entries.length > 0) console.log("🔹 Example entry:", entries[0]);
+
+//     // 3️⃣ Fetch RateMaster for each draw
+//     const userForRate = loggedInUser;
+
+//     // console.log('userForRate===========', userForRate)
+//     // console.log('timeLabel===========', timeLabel)
+
+//     // Get unique draws from entries
+//     const uniqueDraws = [...new Set(entries.map(entry => entry.timeLabel))];
+//     // console.log('uniqueDraws===========', uniqueDraws);
+
+//     // Fetch rate masters for each draw
+//     const rateMastersByDraw = {};
+//     for (const draw of uniqueDraws) {
+//       let rateMasterQuery = { user: userForRate };
+
+//       if (draw === "LSK 3 PM") {
+//         rateMasterQuery.draw = "KERALA 3 PM";
+//       } else {
+//         rateMasterQuery.draw = draw;
+//       }
+
+//       // console.log(`rateMasterQuery for ${draw}:`, rateMasterQuery);
+//       const rateMaster = await RateMaster.findOne(rateMasterQuery);
+//       // console.log(`rateMaster for ${draw}:`, rateMaster);
+
+//       const rateLookup = {};
+//       (rateMaster?.rates || []).forEach(r => {
+//         rateLookup[r.label] = Number(r.rate) || 10;
+//       });
+//       rateMastersByDraw[draw] = rateLookup;
+//     }
+
+//     // console.log("💰 Rate masters by draw:", rateMastersByDraw);
+
+//     // Helper: extract bet type
+//     const extractBetType = (typeStr) => {
+//       // console.log('typeStr', typeStr);
+//       if (!typeStr) return "SUPER";
+
+//       // Handle different patterns: LSK3SUPER, D-1-A, etc.
+//       if (typeStr.toUpperCase().includes("SUPER")) {
+//         return "SUPER";
+//       } else if (typeStr.toUpperCase().includes("BOX")) {
+//         return "BOX";
+//       } else if (typeStr.toUpperCase().includes("AB")) {
+//         return "AB";
+//       } else if (typeStr.toUpperCase().includes("BC")) {
+//         return "BC";
+//       } else if (typeStr.toUpperCase().includes("AC")) {
+//         return "AC";
+//       } else if (typeStr.includes("-A") || typeStr.endsWith("A")) {
+//         return "A";
+//       } else if (typeStr.includes("-B") || typeStr.endsWith("B")) {
+//         return "B";
+//       } else if (typeStr.includes("-C") || typeStr.endsWith("C")) {
+//         return "C";
+//       }
+
+//       // Fallback: extract from parts
+//       const parts = typeStr.split("-");
+//       return parts[parts.length - 1];
+//     };
+
+//     // 4️⃣ Calculate totals
+//     let totalCount = 0;
+//     let totalSales = 0;
+
+//     entries.forEach(entry => {
+//       const count = Number(entry.count) || 0;
+//       const betType = extractBetType(entry.type);
+//       const draw = entry.timeLabel;
+//       const rateLookup = rateMastersByDraw[draw] || {};
+//       const rate = rateLookup[betType] ?? 10;
+
+//       // console.log(`Entry: ${entry.type}, Draw: ${draw}, BetType: ${betType}, Rate: ${rate}, Count: ${count}`);
+
+//       totalCount += count;
+//       totalSales += count * rate;
+//       entry.rate = count * rate;
+//     });
+
+//     // 5️⃣ Build optional per-agent summary
+//     const perAgentMap = {};
+//     entries.forEach((entry) => {
+//       const agent = entry.createdBy || "unknown";
+//       if (!perAgentMap[agent]) {
+//         perAgentMap[agent] = { agent, count: 0, amount: 0 };
+//       }
+//       perAgentMap[agent].count += Number(entry.count) || 0;
+//       perAgentMap[agent].amount += Number(entry.rate) || 0;
+//     });
+//     const byAgent = Object.values(perAgentMap).sort((a, b) => b.amount - a.amount);
+
+//     const report = {
+//       count: totalCount,
+//       amount: totalSales,
+//       date: `${fromDate} to ${toDate} (${timeLabel || "all"})`,
+//       fromDate,
+//       toDate,
+//       createdBy,
+//       timeLabel,
+//       entries,
+//       byAgent,
+//     };
+
+//     // console.log("✅ Final Sales Report (backend):", report);
+//     res.json(report);
+
+//   } catch (err) {
+//     console.error("❌ Error in getSalesReport:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// };
+
+
+// In-memory controlled cache
+// Key: `${loggedInUser}-${createdBy}-${fromDate}-${toDate}-${timeLabel}`
+// Value: report object
+// Value: report object
+const reportCache = new Map();
+
+// --- Helper to get all descendants ---
+function getDescendants(username, allUsers) {
+  const descendants = [];
+  const stack = [username];
+  while (stack.length) {
+    const current = stack.pop();
+    const children = allUsers.filter(u => u.createdBy === current);
+    children.forEach(c => {
+      descendants.push(c.username);
+      stack.push(c.username);
+    });
+  }
+  return descendants;
+}
+
+// --- Helper to get bet type ---
+function getBetType(typeStr) {
+  if (!typeStr) return "SUPER";
+  const upper = typeStr.toUpperCase();
+  if (upper.includes("SUPER")) return "SUPER";
+  if (upper.includes("BOX")) return "BOX";
+  if (upper.includes("AB")) return "AB";
+  if (upper.includes("BC")) return "BC";
+  if (upper.includes("AC")) return "AC";
+  if (typeStr.includes("-A") || typeStr.endsWith("A")) return "A";
+  if (typeStr.includes("-B") || typeStr.endsWith("B")) return "B";
+  if (typeStr.includes("-C") || typeStr.endsWith("C")) return "C";
+  const parts = typeStr.split("-");
+  return parts[parts.length - 1];
+}
+
+// --- Main function ---
 const getSalesReport = async (req, res) => {
   try {
     const { fromDate, toDate, createdBy, timeLabel, loggedInUser } = req.query;
 
-    // console.log("📥 getSalesReport request:", req.query);
-
-    // 1️⃣ Build agent list (loggedInUser or createdBy + descendants)
-    const allUsers = await MainUser.find().select("username createdBy");
-    let agentList = [];
-    if (!createdBy) {
-      agentList = [loggedInUser, ...getDescendants(loggedInUser, allUsers)];
-    } else {
-      agentList = [createdBy, ...getDescendants(createdBy, allUsers)];
+    // --- Step 0: Build controlled cache key ---
+    const cacheKey = `${loggedInUser}-${createdBy || 'all'}-${fromDate}-${toDate}-${timeLabel || 'all'}`;
+    if (reportCache.has(cacheKey)) {
+      console.log('📦 Returning cached report for', cacheKey);
+      return res.json(reportCache.get(cacheKey));
     }
-    // console.log("👥 Agent Users (backend):", agentList);
 
-    // 2️⃣ Build query for entries
+    // --- Step 1: Build agent list ---
+    const allUsers = await MainUser.find().select("username createdBy");
+    const agentList = createdBy
+      ? [createdBy, ...getDescendants(createdBy, allUsers)]
+      : [loggedInUser, ...getDescendants(loggedInUser, allUsers)];
+
+    // --- Step 2: Fetch entries ---
+    const start = parseDateISTStart(fromDate);
+    const end = parseDateISTEnd(toDate);
     const entryQuery = {
       createdBy: { $in: agentList },
-      date: { $gte: new Date(fromDate), $lte: new Date(toDate) },
+      createdAt: { $gte: start, $lte: end },
+      isValid: true,
     };
-    if (timeLabel && timeLabel !== "all") {
-      entryQuery.timeLabel = timeLabel;
-    }
+    if (timeLabel && timeLabel !== "all") entryQuery.timeLabel = timeLabel;
 
     const entries = await Entry.find(entryQuery);
-    const last10Entries = await Entry.find({}).sort({ _id: -1 }).limit(2);
-    // console.log("entrie===========11", entryQuery)
-    // console.log("entrie===========12", last10Entries)
-    // console.log("entrie===========13", entries);
-    // console.log("📝 Entries fetched (backend):", entries.length);
-    // if (entries.length > 0) console.log("🔹 Example entry:", entries[0]);
 
-    // 3️⃣ Fetch RateMaster for each draw
+    // --- Step 3: Fetch rate masters ---
     const userForRate = loggedInUser;
-
-    // console.log('userForRate===========', userForRate)
-    // console.log('timeLabel===========', timeLabel)
-
-    // Get unique draws from entries
-    const uniqueDraws = [...new Set(entries.map(entry => entry.timeLabel))];
-    // console.log('uniqueDraws===========', uniqueDraws);
-
-    // Fetch rate masters for each draw
+    const uniqueDraws = [...new Set(entries.map(e => e.timeLabel))];
     const rateMastersByDraw = {};
+
     for (const draw of uniqueDraws) {
-      let rateMasterQuery = { user: userForRate };
-
-      if (draw === "LSK 3 PM") {
-        rateMasterQuery.draw = "KERALA 3 PM";
-      } else {
-        rateMasterQuery.draw = draw;
-      }
-
-      // console.log(`rateMasterQuery for ${draw}:`, rateMasterQuery);
+      const rateMasterQuery = { user: userForRate, draw: draw === "LSK 3 PM" ? "KERALA 3 PM" : draw };
       const rateMaster = await RateMaster.findOne(rateMasterQuery);
-      // console.log(`rateMaster for ${draw}:`, rateMaster);
 
       const rateLookup = {};
       (rateMaster?.rates || []).forEach(r => {
-        rateLookup[r.label] = Number(r.rate) || 10;
+        rateLookup[r.name || r.label] = Number(r.rate) || 10;
       });
       rateMastersByDraw[draw] = rateLookup;
     }
 
-    // console.log("💰 Rate masters by draw:", rateMastersByDraw);
-
-    // Helper: extract bet type
-    const extractBetType = (typeStr) => {
-      // console.log('typeStr', typeStr);
-      if (!typeStr) return "SUPER";
-
-      // Handle different patterns: LSK3SUPER, D-1-A, etc.
-      if (typeStr.toUpperCase().includes("SUPER")) {
-        return "SUPER";
-      } else if (typeStr.toUpperCase().includes("BOX")) {
-        return "BOX";
-      } else if (typeStr.toUpperCase().includes("AB")) {
-        return "AB";
-      } else if (typeStr.toUpperCase().includes("BC")) {
-        return "BC";
-      } else if (typeStr.toUpperCase().includes("AC")) {
-        return "AC";
-      } else if (typeStr.includes("-A") || typeStr.endsWith("A")) {
-        return "A";
-      } else if (typeStr.includes("-B") || typeStr.endsWith("B")) {
-        return "B";
-      } else if (typeStr.includes("-C") || typeStr.endsWith("C")) {
-        return "C";
-      }
-
-      // Fallback: extract from parts
-      const parts = typeStr.split("-");
-      return parts[parts.length - 1];
-    };
-
-    // 4️⃣ Calculate totals
+    // --- Step 4: Calculate totals ---
     let totalCount = 0;
     let totalSales = 0;
-
     entries.forEach(entry => {
       const count = Number(entry.count) || 0;
-      const betType = extractBetType(entry.type);
+      const betType = getBetType(entry.type);
       const draw = entry.timeLabel;
-      const rateLookup = rateMastersByDraw[draw] || {};
-      const rate = rateLookup[betType] ?? 10;
-
-      // console.log(`Entry: ${entry.type}, Draw: ${draw}, BetType: ${betType}, Rate: ${rate}, Count: ${count}`);
+      const rate = rateMastersByDraw[draw]?.[betType] ?? 10;
 
       totalCount += count;
       totalSales += count * rate;
       entry.rate = count * rate;
     });
 
-    // 5️⃣ Build optional per-agent summary
+    // --- Step 5: Aggregate per agent ---
     const perAgentMap = {};
-    entries.forEach((entry) => {
+    entries.forEach(entry => {
       const agent = entry.createdBy || "unknown";
-      if (!perAgentMap[agent]) {
-        perAgentMap[agent] = { agent, count: 0, amount: 0 };
-      }
+      if (!perAgentMap[agent]) perAgentMap[agent] = { agent, count: 0, amount: 0 };
       perAgentMap[agent].count += Number(entry.count) || 0;
       perAgentMap[agent].amount += Number(entry.rate) || 0;
     });
     const byAgent = Object.values(perAgentMap).sort((a, b) => b.amount - a.amount);
 
+    // --- Step 6: Build report ---
     const report = {
       count: totalCount,
       amount: totalSales,
@@ -2941,29 +3377,18 @@ const getSalesReport = async (req, res) => {
       byAgent,
     };
 
-    // console.log("✅ Final Sales Report (backend):", report);
-    res.json(report);
+    // --- Step 7: Store in cache for 5 minutes ---
+    reportCache.set(cacheKey, report);
+    setTimeout(() => reportCache.delete(cacheKey), 5 * 60 * 1000);
 
+    return res.json(report);
   } catch (err) {
     console.error("❌ Error in getSalesReport:", err);
     res.status(500).json({ error: err.message });
   }
 };
 
-// Helper (same logic as frontend getDescendants)
-function getDescendants(user, allUsers = []) {
-  const descendants = [];
-  const stack = [user];
-  while (stack.length) {
-    const current = stack.pop();
-    const children = allUsers.filter(u => u.createdBy === current);
-    children.forEach(c => {
-      descendants.push(c.username);
-      stack.push(c.username);
-    });
-  }
-  return descendants;
-}
+
 
 
 // =======================
@@ -3306,74 +3731,275 @@ const getOverflowLimitByDrawTime = async (req, res) => {
   }
 };
 
-const getDrawByTime = async (req, res) => {
+
+// ================= GET a draw by tab and drawName =================
+
+// Get draw by drawName and activeTab
+const getDrawByTabAndName = async (req, res) => {
   try {
-    const { draw } = req.query; // get from query param
+    const { activeTab, drawName } = req.query;
 
-    if (!draw) return res.status(400).json({ message: "Draw is required" });
+    if (!activeTab || !drawName) {
+      return res.status(400).json({ message: "activeTab and drawName are required" });
+    }
 
-    const drawData = await Schema.findOne({ draw });
+    const data = await Schema.findOne(
+      {
+        activeTab: Number(activeTab),
+        "draws.drawName": drawName
+      },
+      {
+        draws: { $elemMatch: { drawName } }
+      }
+    );
 
-    if (!drawData) return res.status(404).json({ message: "Draw not found" });
+    if (!data) {
+      return res.status(404).json({ message: "Draw + tab not found" });
+    }
 
-    res.json(drawData);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Error fetching draw scheme" });
-  }
-};
-
-
-const addDrawScheme = async (req, res) => {
-  try {
-    const data = req.body;
-
-    const draw = new Schema(data);
-    await draw.save();
-
-    res.status(201).json({
-      message: "Draw scheme added successfully",
-      data: draw,
+    res.json({
+      activeTab: data.activeTab,
+      draw: data.draws[0]
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 };
 
 
-const updateSuperOnly = async (req, res) => {
-  const { draw, schemes } = req.body;
 
-  if (!draw || !schemes) {
-    return res.status(400).json({ message: "draw and schemes are required" });
-  }
 
+// ================= ADD a draw to a tab =================
+// const addDrawToTab = async (req, res) => {
+//   try {
+//     const { activeTab, drawName, schemes } = req.body;
+
+//     if (!activeTab || !drawName || !schemes)
+//       return res.status(400).json({ message: "activeTab, drawName and schemes are required" });
+
+//     // Find if tab exists
+//     let tabData = await Schema.findOne({ activeTab: Number(activeTab) });
+
+//     const newDraw = { drawName, schemes };
+
+//     if (tabData) {
+//       // Tab exists → add draw
+//       tabData.draws.push(newDraw);
+//       await tabData.save();
+//       return res.status(201).json({ message: "Draw added to existing tab", data: tabData });
+//     } else {
+//       // Tab does not exist → create new tab with draw
+//       const newTab = new Schema({
+//         activeTab: Number(activeTab),
+//         draws: [newDraw],
+//       });
+//       await newTab.save();
+//       return res.status(201).json({ message: "Tab and draw created", data: newTab });
+//     }
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ message: "Error adding draw" });
+//   }
+// };
+
+// ================= ADD/UPDATE a draw to a tab =================
+// ================= ADD/UPDATE a draw to a tab =================
+// ================= ADD/UPDATE a draw to a tab =================
+const addDrawToTab = async (req, res) => {
   try {
-    // Find the draw scheme by draw time
-    const drawDoc = await Schema.findOne({ draw });
-    if (!drawDoc) return res.status(404).json({ message: "Draw not found" });
+    const { activeTab, drawName, schemes } = req.body;
+    if (!activeTab || !drawName || !schemes)
+      return res.status(400).json({ message: "activeTab, drawName and schemes are required" });
+    let tabData = await Schema.findOne({ activeTab: Number(activeTab) });
+    if (tabData) {
+      const drawIndex = tabData.draws.findIndex(d => d.drawName === drawName);
+      if (drawIndex !== -1) {
+        // UPDATE existing draw. schemes is already grouped from the app now.
+        tabData.draws[drawIndex].schemes = schemes;
+      } else {
+        // ADD new draw
+        tabData.draws.push({ drawName, schemes });
+      }
+      
+      tabData.markModified('draws');
+      await tabData.save();
+      return res.status(201).json({ message: "Saved successfully", data: tabData });
+    } else {
+      const newTab = new Schema({
+        activeTab: Number(activeTab),
+        draws: [{ drawName, schemes }],
+      });
+      await newTab.save();
+      return res.status(201).json({ message: "Created successfully", data: newTab });
+    }
+  } catch (err) {
+    console.error("Error saving scheme:", err);
+    res.status(500).json({ message: "Error saving scheme" });
+  }
+};
 
-    // Loop over the groups and rows to update only the 'super' values
-    schemes.forEach((groupUpdate) => {
-      const dbGroup = drawDoc.schemes.find(g => g.group === groupUpdate.group);
-      if (dbGroup) {
-        groupUpdate.rows.forEach((rowUpdate) => {
-          const dbRow = dbGroup.rows.find(r => r.scheme === rowUpdate.scheme);
-          if (dbRow) {
-            dbRow.super = rowUpdate.super; // Update only super
-          }
-        });
+// ================= UPDATE super for a specific draw =================
+
+// const updateSuperForDraw = async (req, res) => {
+//   try {
+//     const { activeTab, drawName, updates } = req.body;
+
+//     if (!activeTab || !drawName || !updates) {
+//       return res.status(400).json({ message: "Missing data" });
+//     }
+
+//     const doc = await Schema.findOne({ activeTab });
+
+//     if (!doc) {
+//       return res.status(404).json({ message: "Tab not found" });
+//     }
+
+//     const draw = doc.draws.find(d => d.drawName === drawName);
+
+//     if (!draw) {
+//       return res.status(404).json({ message: "Draw not found" });
+//     }
+
+//     updates.forEach(u => {
+//       const group = draw.schemes.find(g => g.group === u.group);
+//       if (!group) return;
+
+//       const row = group.rows.find(
+//         r => r.scheme === u.scheme && r.pos === u.pos
+//       );
+
+//       if (row) row.super = u.super;
+//     });
+
+//     await doc.save();
+
+//     res.json({ message: "Super updated successfully" });
+//   } catch (err) {
+//     console.error(err);
+//     res.status(500).json({ message: "Server error" });
+//   }
+// };
+
+const updateSuperForDraw = async (req, res) => {
+  try {
+    const { activeTab, drawName, updates } = req.body;
+    if (!activeTab || !drawName || !updates || !Array.isArray(updates)) {
+      return res.status(400).json({ message: "Missing or invalid data" });
+    }
+    const doc = await Schema.findOne({ activeTab: Number(activeTab) });
+    if (!doc) return res.status(404).json({ message: "Tab not found" });
+    const draw = doc.draws.find(d => d.drawName === drawName);
+    if (!draw) return res.status(404).json({ message: "Draw not found" });
+    updates.forEach(u => {
+      let row;
+      // Navigate through GROUPS to find the ROW
+      for (const group of draw.schemes) {
+        if (group.rows && Array.isArray(group.rows)) {
+           // Find by ID or by matching scheme/pos
+           row = group.rows.find(r => 
+             (u._id && r._id && r._id.toString() === u._id.toString()) ||
+             (r.scheme === u.scheme && r.pos === Number(u.pos))
+           );
+           if (row) {
+             row.super = Number(u.super);
+             console.log(`Updated Row [${row.scheme} ${row.pos}] to ${u.super}`);
+             break;
+           }
+        }
       }
     });
-
-    await drawDoc.save();
-
-    res.json({ message: "Super values updated successfully", data: drawDoc });
+    doc.markModified('draws');
+    await doc.save();
+    res.json({ message: "Super updated successfully" });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server error" });
+    console.error("Error updating super:", err);
+    res.status(500).json({ message: err.message });
   }
 };
+
+
+
+
+
+
+
+
+
+const addUserAmount = async (req, res) => {
+  try {
+    const { fromUser, toUser, amount } = req.body;
+
+    if (!fromUser || !toUser || !amount) {
+      return res.status(400).json({ message: "fromUser, toUser, amount required" });
+    }
+
+    // optional safety check
+    const userExists = await MainUser.findOne({ username: toUser });
+    if (!userExists) {
+      return res.status(404).json({ message: "Selected user not found" });
+    }
+
+    const entry = new UserAmount({
+      fromUser,
+      toUser,
+      amount
+    });
+
+    await entry.save();
+
+    res.status(201).json({
+      message: "Amount added successfully",
+      data: entry
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+const getUserAmounts = async (req, res) => {
+  try {
+    const data = await UserAmount.find();
+
+    res.status(200).json({
+      message: "User amount data fetched successfully",
+      data
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+const updateAmountOnly = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { amount } = req.body;
+
+    if (!amount) {
+      return res.status(400).json({ message: "amount is required" });
+    }
+
+    const updatedData = await UserAmount.findByIdAndUpdate(
+      id,
+      { amount },
+      { new: true }
+    );
+
+    if (!updatedData) {
+      return res.status(404).json({ message: "Record not found" });
+    }
+
+    res.status(200).json({
+      message: "Amount updated successfully",
+      data: updatedData
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+
 
 
 
@@ -3422,8 +4048,10 @@ module.exports = {
   getOverflowLimit,
   saveOverflowLimit,
   getOverflowLimitByDrawTime,
-  addDrawScheme,
-  updateSuperOnly,
-  addDrawScheme,
-  getDrawByTime
+ getDrawByTabAndName,
+  addDrawToTab,
+  updateSuperForDraw,
+  addUserAmount,
+  getUserAmounts,
+  updateAmountOnly
 };

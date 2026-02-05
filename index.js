@@ -5,8 +5,25 @@ dotenv.config();
 const connectDB = require('./database/model/ConnectToDb');
 const Controller = require('./controller/Controller');
 
+const MainUser = require('./model/MainUser');
+const Entry = require('./model/Entry');
+const RateMaster = require('./model/RateMaster');
+
+
 const app = express();
 connectDB();
+
+async function ensureIndexes() {
+  try {
+    await Entry.syncIndexes();
+    await MainUser.syncIndexes();
+    await RateMaster.syncIndexes();
+    console.log("✅ MongoDB indexes ensured");
+  } catch (err) {
+    console.error("❌ Index creation failed:", err);
+  }
+}
+
 app.use(express.json());
 
 
@@ -64,11 +81,17 @@ app.get('/overflow-limit', Controller.getOverflowLimit);
 app.post('/overflow-limit', Controller.saveOverflowLimit);
 app.get('/overflow-limit/by-drawtime', Controller.getOverflowLimitByDrawTime);
 // ADD new draw scheme (admin)
-app.post("/draw-scheme", Controller.addDrawScheme);
+app.post("/draw-scheme", Controller.addDrawToTab);
 // GET draw scheme by time
-app.get('/draw-scheme', Controller.getDrawByTime);
+app.get('/draw-scheme', Controller.getDrawByTabAndName);
 // UPDATE super value only
-app.patch("/draw-scheme/super", Controller.updateSuperOnly);
+app.put("/draw-scheme/super", Controller.updateSuperForDraw);
+app.post('/add-amount', Controller.addUserAmount);
+app.get('/get-amount', Controller.getUserAmounts);
+app.patch('/user-amount/:id/amount', Controller.updateAmountOnly);
+
+
+
 
 
 
